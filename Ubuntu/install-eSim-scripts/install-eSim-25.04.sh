@@ -64,6 +64,7 @@ function installNghdl
 
     echo "Installing NGHDL..........................."
     unzip -o nghdl.zip
+    configureNgHdlForPlucky
     cd nghdl/
     chmod +x install-nghdl.sh
 
@@ -113,7 +114,7 @@ function installKicad
 
     # Define KiCad PPAs based on Ubuntu version
     if [[ "$ubuntu_version" == "24.04" || "$ubuntu_version" == "25.04" ]]; then
-        echo "Ubuntu $ubuntu_version detected."
+        echo "Ubuntu 24.04 detected."
         kicadppa="kicad/kicad-8.0-releases"
 
         # Check if KiCad is installed using dpkg-query for the main package
@@ -133,7 +134,7 @@ function installKicad
                 fi
             else
                 echo "KiCad 8.0 is already installed."
-                exit 0
+                return 0
             fi
         fi
 
@@ -151,7 +152,7 @@ function installKicad
     fi
 
     # Install KiCad packages
-    sudo apt-get install -y --no-install-recommends kicad=8.0.8+dfsg-1 kicad-footprints kicad-libraries kicad-symbols kicad-templates
+    sudo apt-get install -y --no-install-recommends kicad kicad-footprints kicad-libraries kicad-symbols kicad-templates
 
     echo "KiCad installation completed successfully!"
 }
@@ -231,15 +232,18 @@ function copyKicadLibrary
     #Extract custom KiCad Library
     tar -xJf library/kicadLibrary.tar.xz
 
-    if [ -d ~/.config/kicad/6.0 ];then
-        echo "kicad config folder already exists"
-    else 
-        echo ".config/kicad/6.0 does not exist"
-        mkdir -p ~/.config/kicad/6.0
+    # Ubuntu 25.04 ships KiCad 8, so the old hard-coded 6.0 config path
+    # silently installed eSim's symbol table into a directory KiCad never
+    # reads.  Discover the newest installed config directory instead.
+    kicad_config_dir="$HOME/.config/kicad"
+    latest_version=$(ls "$kicad_config_dir" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+    if [ -z "$latest_version" ]; then
+        latest_version="8.0"
     fi
+    mkdir -p "$kicad_config_dir/$latest_version"
 
-    # Copy symbol table for eSim custom symbols 
-    cp kicadLibrary/template/sym-lib-table ~/.config/kicad/6.0/
+    # Copy symbol table for eSim custom symbols
+    cp kicadLibrary/template/sym-lib-table "$kicad_config_dir/$latest_version/"
     echo "symbol table copied in the directory"
 
     # Copy KiCad symbols made for eSim
@@ -319,6 +323,54 @@ function createDesktopStartScript
 
 }
 
+
+
+# Ubuntu 25.04 ships LLVM 20 by default, but the GHDL 4.1.0 source bundled
+# with eSim 2.5 only understands LLVM <= 18.1.  Patch the extracted NGHDL
+# installer in-place so it selects LLVM 18 and also teaches its dispatcher
+# about Plucky.  Both edits are idempotent.
+function configureNgHdlForPlucky
+{
+    local dispatcher="nghdl/install-nghdl.sh"
+    local plucky_script="nghdl/install-nghdl-scripts/install-nghdl-24.04.sh"
+
+    if [[ ! -f "$dispatcher" || ! -f "$plucky_script" ]]; then
+        echo "NGHDL installer files not found; skipping Plucky adjustments"
+        return 0
+    fi
+
+    if ! grep -q '"25.04"' "$dispatcher"; then
+        python3 - "$dispatcher" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as fh:
+    text = fh.read()
+needle = '''        "24.04")
+            SCRIPT="$SCRIPT_DIR/install-nghdl-24.04.sh"
+            ;;
+'''
+replacement = needle + '''        "25.04")
+            SCRIPT="$SCRIPT_DIR/install-nghdl-24.04.sh"
+            ;;
+'''
+if needle not in text:
+    raise SystemExit("NGHDL 24.04 case not found")
+with open(path, "w") as fh:
+    fh.write(text.replace(needle, replacement, 1))
+PYEOF
+        echo "Patched NGHDL version dispatcher for Ubuntu 25.04"
+    fi
+
+    if grep -q 'apt install -y llvm llvm-dev' "$plucky_script"; then
+        sed -i 's/apt install -y llvm llvm-dev/apt install -y llvm-18 llvm-18-dev llvm-18-tools/' "$plucky_script"
+        echo "Pinned NGHDL LLVM dependencies to LLVM 18"
+    fi
+
+    if grep -q -- '--with-llvm-config=/usr/bin/llvm-config$' "$plucky_script"; then
+        sed -i 's#--with-llvm-config=/usr/bin/llvm-config$#--with-llvm-config=/usr/bin/llvm-config-18#' "$plucky_script"
+        echo "Pointed GHDL configure at llvm-config-18"
+    fi
+}
 
 ####################################################################
 #                   MAIN START FROM HERE                           #
@@ -417,7 +469,11 @@ elif [ $option == "--uninstall" ];then
         sudo apt purge -y kicad kicad-footprints kicad-libraries kicad-symbols kicad-templates
         sudo rm -rf /usr/share/kicad
 	sudo rm /etc/apt/sources.list.d/kicad*
-        rm -rf $HOME/.config/kicad/6.0
+        kicad_config_dir="$HOME/.config/kicad"
+        latest_version=$(ls "$kicad_config_dir" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+        if [ -n "$latest_version" ]; then
+            rm -rf "$kicad_config_dir/$latest_version"
+        fi
 
         echo "Removing Virtual env......................."
         sudo rm -r $config_dir/env

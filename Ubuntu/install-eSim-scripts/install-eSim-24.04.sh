@@ -15,8 +15,6 @@
 #       AUTHORS: Fahim Khan, Rahul Paknikar, Saurabh Bansode,
 #                Sumanto Kar, Partha Singha Roy, Harsha Narayana P, 
 #                Jayanth Tatineni, Anshul Verma
-#       MENTORS: Sumanto Kar, Varad Patil, Shanti Priya K, Aditya M
-#       INTERNS: Akshay Rukade, Haripriyan R
 #  ORGANIZATION: eSim Team, FOSSEE, IIT Bombay
 #       CREATED: Wednesday 15 July 2015 15:26
 #      REVISION: Sunday 25 May 2025 17:40
@@ -66,6 +64,7 @@ function installNghdl
 
     echo "Installing NGHDL..........................."
     unzip -o nghdl.zip
+    configureNgHdlForPlucky
     cd nghdl/
     chmod +x install-nghdl.sh
 
@@ -87,45 +86,22 @@ function installSky130Pdk
 {
 
     echo "Installing SKY130 PDK......................"
-
     
+    # Extract SKY130 PDK
+    tar -xJf library/sky130_fd_pr.tar.xz
+
     # Remove any previous sky130-fd-pdr instance, if any
     sudo rm -rf /usr/share/local/sky130_fd_pr
-    #installing sky130
-    volare enable --pdk sky130 --pdk-root /usr/share/local/ 0fe599b2afb6708d281543108caf8310912f54af
+
     # Copy SKY130 library
     echo "Copying SKY130 PDK........................."
 
     sudo mkdir -p /usr/share/local/
-    sudo mv /usr/share/local/volare/sky130/versions/0fe599b2afb6708d281543108caf8310912f54af/sky130A/libs.ref/sky130_fd_pr /usr/share/local/
-    rm -rf /usr/share/local/volare/
+    sudo mv sky130_fd_pr /usr/share/local/
 
     # Change ownership from root to the user
     sudo chown -R $USER:$USER /usr/share/local/sky130_fd_pr/
 
-}
-
-function installIhpPdk
-{
-    echo -n "Do you want to install IHP Open PDK for analog IC design? (y/n): "
-    read installIhp
-    
-    if [ "$installIhp" == "y" -o "$installIhp" == "Y" ]; then
-        echo "Installing IHP Open PDK........................"
-        
-        if [ -f "ihp/ihp-install-script.sh" ]; then
-            cd ihp/
-            chmod +x ihp-install-script.sh
-            trap "" ERR
-            ./ihp-install-script.sh --install
-            trap error_exit ERR
-            cd ../
-        else
-            echo "IHP install script not found. Skipping..."
-        fi
-    else
-        echo "Skipping IHP Open PDK installation"
-    fi
 }
 
 
@@ -137,7 +113,7 @@ function installKicad
     ubuntu_version=$(lsb_release -rs)
 
     # Define KiCad PPAs based on Ubuntu version
-    if [[ "$ubuntu_version" == "24.04" ]]; then
+    if [[ "$ubuntu_version" == "24.04" || "$ubuntu_version" == "25.04" ]]; then
         echo "Ubuntu 24.04 detected."
         kicadppa="kicad/kicad-8.0-releases"
 
@@ -158,7 +134,7 @@ function installKicad
                 fi
             else
                 echo "KiCad 8.0 is already installed."
-                exit 0
+                return 0
             fi
         fi
 
@@ -247,10 +223,6 @@ function installDependency
 
     echo "Installing PyQt5............."
     pip3 install PyQt5  
-
-    echo "Installing volare"
-    sudo apt-get xz-utils
-    pip3 install volare
 }
 
 
@@ -260,15 +232,18 @@ function copyKicadLibrary
     #Extract custom KiCad Library
     tar -xJf library/kicadLibrary.tar.xz
 
-    if [ -d ~/.config/kicad/6.0 ];then
-        echo "kicad config folder already exists"
-    else 
-        echo ".config/kicad/6.0 does not exist"
-        mkdir -p ~/.config/kicad/6.0
+    # Ubuntu 25.04 ships KiCad 8, so the old hard-coded 6.0 config path
+    # silently installed eSim's symbol table into a directory KiCad never
+    # reads.  Discover the newest installed config directory instead.
+    kicad_config_dir="$HOME/.config/kicad"
+    latest_version=$(ls "$kicad_config_dir" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+    if [ -z "$latest_version" ]; then
+        latest_version="8.0"
     fi
+    mkdir -p "$kicad_config_dir/$latest_version"
 
-    # Copy symbol table for eSim custom symbols 
-    cp kicadLibrary/template/sym-lib-table ~/.config/kicad/6.0/
+    # Copy symbol table for eSim custom symbols
+    cp kicadLibrary/template/sym-lib-table "$kicad_config_dir/$latest_version/"
     echo "symbol table copied in the directory"
 
     # Copy KiCad symbols made for eSim
@@ -349,6 +324,54 @@ function createDesktopStartScript
 }
 
 
+
+# Ubuntu 25.04 ships LLVM 20 by default, but the GHDL 4.1.0 source bundled
+# with eSim 2.5 only understands LLVM <= 18.1.  Patch the extracted NGHDL
+# installer in-place so it selects LLVM 18 and also teaches its dispatcher
+# about Plucky.  Both edits are idempotent.
+function configureNgHdlForPlucky
+{
+    local dispatcher="nghdl/install-nghdl.sh"
+    local plucky_script="nghdl/install-nghdl-scripts/install-nghdl-24.04.sh"
+
+    if [[ ! -f "$dispatcher" || ! -f "$plucky_script" ]]; then
+        echo "NGHDL installer files not found; skipping Plucky adjustments"
+        return 0
+    fi
+
+    if ! grep -q '"25.04"' "$dispatcher"; then
+        python3 - "$dispatcher" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as fh:
+    text = fh.read()
+needle = '''        "24.04")
+            SCRIPT="$SCRIPT_DIR/install-nghdl-24.04.sh"
+            ;;
+'''
+replacement = needle + '''        "25.04")
+            SCRIPT="$SCRIPT_DIR/install-nghdl-24.04.sh"
+            ;;
+'''
+if needle not in text:
+    raise SystemExit("NGHDL 24.04 case not found")
+with open(path, "w") as fh:
+    fh.write(text.replace(needle, replacement, 1))
+PYEOF
+        echo "Patched NGHDL version dispatcher for Ubuntu 25.04"
+    fi
+
+    if grep -q 'apt install -y llvm llvm-dev' "$plucky_script"; then
+        sed -i 's/apt install -y llvm llvm-dev/apt install -y llvm-18 llvm-18-dev llvm-18-tools/' "$plucky_script"
+        echo "Pinned NGHDL LLVM dependencies to LLVM 18"
+    fi
+
+    if grep -q -- '--with-llvm-config=/usr/bin/llvm-config$' "$plucky_script"; then
+        sed -i 's#--with-llvm-config=/usr/bin/llvm-config$#--with-llvm-config=/usr/bin/llvm-config-18#' "$plucky_script"
+        echo "Pointed GHDL configure at llvm-config-18"
+    fi
+}
+
 ####################################################################
 #                   MAIN START FROM HERE                           #
 ####################################################################
@@ -424,7 +447,6 @@ if [ $option == "--install" ];then
     copyKicadLibrary
     installNghdl
     installSky130Pdk
-    installIhpPdk
     createDesktopStartScript
 
     if [ $? -ne 0 ];then
@@ -447,21 +469,17 @@ elif [ $option == "--uninstall" ];then
         sudo apt purge -y kicad kicad-footprints kicad-libraries kicad-symbols kicad-templates
         sudo rm -rf /usr/share/kicad
 	sudo rm /etc/apt/sources.list.d/kicad*
-        rm -rf $HOME/.config/kicad/6.0
+        kicad_config_dir="$HOME/.config/kicad"
+        latest_version=$(ls "$kicad_config_dir" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+        if [ -n "$latest_version" ]; then
+            rm -rf "$kicad_config_dir/$latest_version"
+        fi
 
         echo "Removing Virtual env......................."
         sudo rm -r $config_dir/env
 
         echo "Removing SKY130 PDK......................"
         sudo rm -R /usr/share/local/sky130_fd_pr
-
-        echo "Removing IHP Open PDK...................."
-        if [ -f "ihp/install-ihp-openpdk.sh" ]; then
-            cd ihp/
-            chmod +x install-ihp-openpdk.sh
-            ./install-ihp-openpdk.sh --uninstall
-            cd ../
-        fi
 
         echo "Removing NGHDL..........................."
         rm -rf library/modelParamXML/Nghdl/*
